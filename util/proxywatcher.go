@@ -12,11 +12,12 @@ import (
 // It re-discovers from CSF, cPHulk, and iptables on a configurable interval
 // and supports on-demand reloads via Reload().
 type ProxyWatcher struct {
-	nets   atomic.Value // stores []*net.IPNet — for CIDR matching
-	cache  atomic.Value // stores map[string]bool — fast-path for exact IP matches
-	manual []string     // static entries from env / API calls
-	mu     sync.Mutex   // guards manual slice and Reload()
-	stop   chan struct{}
+	nets      atomic.Value // stores []*net.IPNet — for CIDR matching
+	cache     atomic.Value // stores map[string]bool — fast-path for exact IP matches
+	manual    []string     // static entries from env / API calls
+	mu        sync.Mutex   // guards manual slice and Reload()
+	stop      chan struct{}
+	onReload  func()       // optional callback fired after every reload
 }
 
 // NewProxyWatcher creates a watcher, does an immediate load, then refreshes
@@ -68,10 +69,26 @@ func (w *ProxyWatcher) IsTrusted(ipStr string) bool {
 }
 
 // Reload forces an immediate re-read of all sources. Safe to call concurrently.
+// The onReload hook runs WITHOUT holding mu, so a hook that calls back into
+// the watcher (or a panicking hook) cannot deadlock or double-unlock.
 func (w *ProxyWatcher) Reload() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.reload()
+	hook := w.onReload
+	w.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+// SetOnReloadHook registers a function to be called (outside the
+// watcher mutex) after every Reload. Used by the middleware package
+// to invalidate the IP-resolution cache when the trusted-proxy set
+// changes (Finding 4.2). Hardened 2026-09-25.
+func (w *ProxyWatcher) SetOnReloadHook(fn func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onReload = fn
 }
 
 // AddManual adds a single IP or CIDR to the permanent manual list and reloads.

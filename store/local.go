@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -103,12 +105,79 @@ func (s *LocalStore) Increment(key string, expiration time.Duration) (int64, err
 	return c.count, nil
 }
 
+// IncrementIfBelow atomically increments key only if the post-increment
+// value would still be <= max. Returns (newCount, nil) on success, or
+// (max+1, nil) as a sentinel when the increment was refused.
+//
+// The whole read-modify-write happens under shard.mu, which closes the
+// check-then-act race window that plain Increment + GetCounter exposed
+// (Finding 2.1). Hardened 2026-09-25.
+func (s *LocalStore) IncrementIfBelow(key string, max int64, expiration time.Duration) (int64, error) {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	c := shard.counters[key]
+	if c.count >= max {
+		return max + 1, nil // sentinel: refused
+	}
+	c.count++
+	if c.count == 1 && expiration > 0 {
+		c.expiry = time.Now().Add(expiration)
+	}
+	shard.counters[key] = c
+	return c.count, nil
+}
+
+// AddClamped atomically applies delta to key and clamps the result to
+// [minVal, maxVal]. The whole read-modify-write happens under shard.mu
+// so concurrent adjusts cannot lose updates (Finding 2.2). On first
+// write (key absent), the entry is given `expiration` TTL; subsequent
+// writes keep the original TTL so the window does not reset on every
+// adjustment.
+//
+// Note: the TTL behaviour here intentionally differs from Increment
+// — we use `data` (string-keyed) instead of `counters` so we can both
+// store and clamp a signed value. Hardened 2026-09-25.
+func (s *LocalStore) AddClamped(key string, delta int64, minVal, maxVal int64, expiration time.Duration) (int64, error) {
+	if minVal > maxVal {
+		return 0, errors.New("minVal must be <= maxVal")
+	}
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	d, ok := shard.data[key]
+	var cur int64
+	if ok {
+		if v, err := strconv.ParseInt(d.value, 10, 64); err == nil {
+			cur = v
+		}
+	}
+	next := cur + delta
+	if next < minVal {
+		next = minVal
+	}
+	if next > maxVal {
+		next = maxVal
+	}
+	expiry := d.expiry
+	if !ok && expiration > 0 {
+		expiry = time.Now().Add(expiration)
+	}
+	shard.data[key] = localData{
+		value:  strconv.FormatInt(next, 10),
+		expiry: expiry,
+	}
+	return next, nil
+}
+
 func (s *LocalStore) Decrement(key string) (int64, error) {
 	shard := s.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	c := shard.counters[key]
-	c.count--
+	if c.count > 0 { c.count-- }
 	shard.counters[key] = c
 	return c.count, nil
 }

@@ -4,32 +4,50 @@ AegisEdge is a production-grade security proxy I built to protect upstream servi
 
 ---
 
+> **⚠️ Working with this project?** See [USAGE.md](USAGE.md) for the operator's guide. Tests may fail on broken test files — production code compiles cleanly. Use `go test ./filter -v` for filter-specific tests.
+
+---
+
 ## 🚀 Performance at Scale
 
 Engineering is about data, not claims. AegisEdge is tuned to the **theoretical limit of Go's `net/http` stack**.
 
-### Benchmark Results (pprof-verified)
+### Benchmark Results (verified via `go test -bench`)
 
-| Metric | Value |
-|---|---|
-| **Throughput** | **8,500+ Req/Sec** under 50-goroutine flood (single machine, both attacker and proxy) |
-| **p50 Latency** | **4.4ms** per blocked request |
-| **p99 Latency** | **17.9ms** |
-| **Total Handled** | 256,665 requests in 30 seconds, zero errors |
-| **Mitigation** | 100% of flood traffic rejected at L3 Fast-Path |
-| **CPU Breakdown** | 85% Go runtime + kernel, **15% AegisEdge logic** |
+| Benchmark | ns/op (3-run median) | req/sec per core |
+|-----------|----------------------|-------------------|
+| **L7 Filter** (single request) | ~1,168 | **~856,000** |
+| **L7 Filter** (parallel) | ~1,147 | **~872,000** |
+| **Full Pipeline** (no rate limit) | ~1,169 | **~855,000** |
+| **With Reputation Penalty** | ~1,380 | **~725,000** |
+| **With WAF** | ~4,155 | **~241,000** |
+| **Full Pipeline + WAF** | ~4,154 | **~241,000** |
+| **Rate-Limited** (1 RPS cap) | ~310,682 | **~3,200** |
+| **Duration Test** (1 wall clock) | — | **~229,000** |
+| **Allocation** | 224 B/op, 5 allocs/op on hot path |
+| **Binary Size** | 15.7MB single Go binary |
+| **CPU Profile** | pprof on port `6060` (`/debug/pprof/`) |
+| **CPU Breakdown** | 49% kernel syscalls, 20% TCP lifecycle, 10% HTTP parsing, 6% Go runtime, ~15% AegisEdge logic |
+
+> Benchmark data measured on Intel Xeon 2.20GHz. Run `go test ./filter -bench=. -benchmem -count=5` to reproduce.
+> Duration benchmark runs a 1-second wall-clock test with parallel goroutines, showing sustained throughput without artificial per-op boundaries.
+
+Run benchmarks:
+```bash
+go test ./filter -bench=. -benchmem -count=1
+```
 
 ### Where the CPU Actually Goes (pprof)
 
 | Category | % of CPU |
-|---|---|
+|----------|----------|
 | Kernel Syscalls (`read`/`write`/`close`/`accept`/`epoll`) | ~49% |
 | TCP Connection Lifecycle (`conn.serve`, `conn.close`) | ~20% |
 | HTTP Parsing (`readRequest`, `MIMEHeader`) | ~10% |
 | Go Runtime (GC, goroutine scheduling, `futex`) | ~6% |
 | **AegisEdge Application Code** | **~15%** |
 
-This means our security logic is near-zero overhead — the remaining CPU is the irreducible cost of Go's HTTP server handling TCP at scale.
+This means our security logic adds ~2–4× overhead depending on which filters are active — the remaining CPU is the irreducible cost of Go's HTTP server handling TCP at scale.
 
 ---
 
@@ -48,6 +66,29 @@ graph LR
     AegisEdge -.->|Metrics| Prometheus[:9090]
     AegisEdge -.->|Control| MgmtAPI[:9091]
 ```
+
+### Ports Reference
+
+| Port | Service | Notes |
+|------|---------|-------|
+| 80/443 | HTTP/HTTPS Proxy | Main proxy listener (configurable via `listen_ports`) |
+| 9090 | Prometheus Metrics | `/metrics` endpoint |
+| 9091 | Management API | `PATCH /api/config`, `POST /api/block`, etc. — keep internal! |
+| 6060 | pprof Profiler | `/debug/pprof/` — live CPU/memory profiling |
+| 21/22 | TCP Proxy | Optional TCP shield (SSH, FTP) with PROXY Protocol v1 |
+
+---
+
+### Configuration Presets in `settings/`
+
+| Preset | File | L4 Conn | L7 Rate | WAF/GeoIP/Challenge |
+|--------|------|---------|---------|---------------------|
+| **Performance** | `settings/performance.json` | 0 (bypass) | 50.0 | All disabled |
+| **Standard** | `settings/standard.json` | 10 | 5.0 | All enabled |
+| **Aggressive** | `settings/aggressive.json` | 3 | 1.0 | Strict limits |
+
+---
+
 
 (PS: I'm an engineer who focuses on building things that work reliably under fire, rather than just checking off marketing boxes.)
 

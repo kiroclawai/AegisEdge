@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"aegisedge/logger"
 	"aegisedge/manager"
 	"aegisedge/middleware"
+	"aegisedge/notifier"
 	"aegisedge/proxy"
 	"aegisedge/store"
 	"aegisedge/util"
@@ -50,14 +52,18 @@ func main() {
 		logger.SetLevel(cfg.LogLevel)
 	}
 
-	logger.Info("Starting AegisEdge", "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
+	logger.Info("Starting AegisEdge", "version", Version, "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
 
 	// Initialize Storage (Local with Redis upgrade)
 	var activeStore store.Storer = store.NewLocalStore()
 	redisAddr := os.Getenv("AEGISEDGE_REDIS_ADDR")
 	if redisAddr != "" {
-		activeStore = store.NewRedisStore(redisAddr, os.Getenv("AEGISEDGE_REDIS_PASSWORD"))
-		logger.Info("Distributed state initialized (Redis)", "addr", redisAddr)
+		if rs := store.NewRedisStore(redisAddr, os.Getenv("AEGISEDGE_REDIS_PASSWORD")); rs != nil {
+			activeStore = rs
+			logger.Info("Distributed state initialized (Redis)", "addr", redisAddr)
+		} else {
+			logger.Error("Redis init failed — falling back to in-memory store", "addr", redisAddr)
+		}
 	} else {
 		logger.Info("In-memory state initialized (Local fallback)")
 	}
@@ -143,59 +149,73 @@ func main() {
 	// ProxyWatcher: auto-discovers from CSF/cPHulk/iptables and merges with
 	// the manual AEGISEDGE_TRUSTED_PROXY env var. Refreshes every 5 minutes.
 	proxyWatcher := util.NewProxyWatcher(os.Getenv("AEGISEDGE_TRUSTED_PROXY"), 5*time.Minute)
+	// Finding 4.2: flush the IP-resolution cache when the trusted-proxy
+	// set changes so stale resolutions don't survive a reload.
+	proxyWatcher.SetOnReloadHook(middleware.PurgeAllIPCache)
 	logger.Info("Trusted proxy watcher started", "refresh_interval", "5m")
+
+	// TCP PROXY Protocol trust: only watcher-trusted peers (or loopback)
+	// may assert a PROXY header. Untrusted "PROXY ..." lines are ignored.
+	filter.SetStreamProxyTrustCheck(proxyWatcher.IsTrusted)
 
 	// Management API Instance
 	mgmt := manager.NewManagementAPI(activeStore, toggles, proxyWatcher)
+	mgmt.Version = Version
+	notifier.SetUserAgent("AegisEdge/" + Version)
 
 	// finalHandler: L3/L4 gate + Prometheus metrics + upstream proxy
 	finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := util.GetRealIP(r)
 		mgmt.TrackRequest()
 
-		// Developer Whitelist Bypass (Absolute Precedence)
-		if l3.IsWhitelisted(host) {
-			// Skip all security layers and go straight to proxy
-			goto proceedToProxy
-		}
-
-		// Layer 3 (Centralized Block Check)
-		if activeStore.IsBlocked(host) {
-			logger.Warn("Blocked request: IP is in active block list", "remote_addr", host)
-			if toggles.IsEnabled("stats") {
-				filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
+		// Developer Whitelist Bypass (Absolute Precedence): skip L3/L4.
+		if !l3.IsWhitelisted(host) {
+			// Layer 3 (Centralized Block Check)
+			if activeStore.IsBlocked(host) {
+				logger.Warn("Blocked request: IP is in active block list", "remote_addr", host)
+				if toggles.IsEnabled("stats") {
+					filter.BlockedRequests.WithLabelValues("L3", "active_block").Inc()
+				}
+				http.Error(w, "Access Denied (Active Block)", http.StatusForbidden)
+				return
 			}
-			http.Error(w, "Access Denied (Active Block)", http.StatusForbidden)
-			return
-		}
 
-		if l3.IsBlacklisted(host) {
-			logger.Warn("Blocked request: IP is blacklisted", "remote_addr", host)
-			if toggles.IsEnabled("stats") {
-				filter.BlockedRequests.WithLabelValues("L3", "blacklist").Inc()
+			if l3.IsBlacklisted(host) {
+				logger.Warn("Blocked request: IP is blacklisted", "remote_addr", host)
+				if toggles.IsEnabled("stats") {
+					filter.BlockedRequests.WithLabelValues("L3", "blacklist").Inc()
+				}
+				http.Error(w, "Access Denied", http.StatusForbidden)
+				return
 			}
-			http.Error(w, "Access Denied", http.StatusForbidden)
-			return
-		}
 
-		// Layer 4
-		if !l4.AllowConnection(r.RemoteAddr) {
-			if toggles.IsEnabled("stats") {
-				filter.BlockedRequests.WithLabelValues("L4", "conn_limit").Inc()
+			// Layer 4 (uses the resolved client IP, not the TCP peer).
+			// Hardened 2026-10-05: previously r.RemoteAddr (the load
+			// balancer / CDN edge when behind a trusted proxy), which
+			// lumped every client into one shared connection bucket —
+			// a single abusive client tripped the cap for everyone and
+			// per-attacker limiting did not exist. L3 above already
+			// uses `host`; L4 must match.
+			allowed, release := l4.AllowConnection(host)
+			if !allowed {
+				if toggles.IsEnabled("stats") {
+					filter.BlockedRequests.WithLabelValues("L4", "conn_limit").Inc()
+				}
+				http.Error(w, "Too many connections", http.StatusServiceUnavailable)
+				return
 			}
-			http.Error(w, "Too many connections", http.StatusServiceUnavailable)
-			return
+			defer release()
 		}
-		defer l4.ReleaseConnection(r.RemoteAddr)
 
-	proceedToProxy:
 		// Dynamic Routing: Choose the upstream based on the port in the context
 		targetProxy := defaultProxy
 		if pVal := r.Header.Get("X-Aegis-Port"); pVal != "" {
-			var port int
-			fmt.Sscanf(pVal, "%d", &port)
-			if specialized, exists := proxies[port]; exists {
-				targetProxy = specialized
+			// Strict parse: WithPortInfo always writes %d, so anything
+			// else is corruption — fall through to defaultProxy.
+			if port, err := strconv.Atoi(pVal); err == nil {
+				if specialized, exists := proxies[port]; exists {
+					targetProxy = specialized
+				}
 			}
 		}
 
@@ -273,7 +293,10 @@ func main() {
 		securityStack.ServeHTTP(w, r)
 	})
 
-	// pprof endpoint for CPU profiling (http://localhost:6060/debug/pprof/)
+	// pprof endpoint for CPU profiling — loopback only. pprof exposes
+	// goroutine stacks, heap contents and symbol tables; it must never
+	// listen on 0.0.0.0. Override with AEGISEDGE_PPROF_BIND (dev only).
+	pprofBind := getenvDefault("AEGISEDGE_PPROF_BIND", "127.0.0.1:6060")
 	go func() {
 		import_pprof_mux := http.NewServeMux()
 		import_pprof_mux.HandleFunc("/debug/pprof/", pprof_handler.Index)
@@ -281,25 +304,33 @@ func main() {
 		import_pprof_mux.HandleFunc("/debug/pprof/profile", pprof_handler.Profile)
 		import_pprof_mux.HandleFunc("/debug/pprof/symbol", pprof_handler.Symbol)
 		import_pprof_mux.HandleFunc("/debug/pprof/trace", pprof_handler.Trace)
-		logger.Info("pprof profiling active", "port", 6060)
-		http.ListenAndServe(":6060", import_pprof_mux)
+		logger.Info("pprof profiling active", "bind", pprofBind)
+		http.ListenAndServe(pprofBind, import_pprof_mux)
 	}()
 
 	// Metrics endpoint
+	metricsBind := getenvDefault("AEGISEDGE_METRICS_BIND", "127.0.0.1:9090")
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		logger.Info("Metrics engine active", "port", 9090)
-		http.ListenAndServe(":9090", mux)
+		logger.Info("Metrics engine active", "bind", metricsBind)
+		http.ListenAndServe(metricsBind, mux)
 	}()
 
-	// Management API (Protected/Internal) — wired with LiveToggles for real-time config
-	go func() {
-		mux := http.NewServeMux()
-		mgmt.ServeHTTP(mux)
-		logger.Info("Management API active", "port", 9091)
-		http.ListenAndServe(":9091", manager.APIKeyAuth(mux))
-	}()
+	// Management API (Protected/Internal) — wired with LiveToggles for real-time config.
+	// Binds loopback by default; set AEGISEDGE_MGMT_BIND to expose wider.
+	// Set AEGISEDGE_DISABLE_MGMT=1 to not listen at all (lock-down).
+	if os.Getenv("AEGISEDGE_DISABLE_MGMT") != "1" {
+		go func() {
+			mux := http.NewServeMux()
+			mgmt.ServeHTTP(mux)
+			mgmtBind := getenvDefault("AEGISEDGE_MGMT_BIND", "127.0.0.1:9091")
+			logger.Info("Management API active", "bind", mgmtBind)
+			http.ListenAndServe(mgmtBind, manager.APIKeyAuth(mux))
+		}()
+	} else {
+		logger.Info("Management API disabled via AEGISEDGE_DISABLE_MGMT=1")
+	}
 
 	// Initialize Servers for all configured ports
 	var servers []*http.Server
@@ -456,4 +487,12 @@ func WithPortInfo(port int) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// getenvDefault returns os.Getenv(key) or def when unset/empty.
+func getenvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
