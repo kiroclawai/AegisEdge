@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aegisedge/filter"
@@ -19,19 +21,29 @@ const (
 	CookieExpiry        = 3600 // 1 hour in seconds
 )
 
-var secretKey = []byte(getSecret())
+var (
+	secretOnce sync.Once
+	secretKey  []byte
+)
 
-func getSecret() string {
-	s := os.Getenv("AEGISEDGE_SECRET")
-	if s == "" {
-		return "dev-default-secret-key-change-me"
-	}
-	return s
+// getSecretKey loads AEGISEDGE_SECRET on first use (fail-closed).
+// Lazy so package import / unit tests that never touch challenges do not panic.
+func getSecretKey() []byte {
+	secretOnce.Do(func() {
+		s := os.Getenv("AEGISEDGE_SECRET")
+		if s == "" {
+			panic("AEGISEDGE_SECRET is required; generate one with `openssl rand -hex 32`")
+		}
+		if len(s) < 32 {
+			panic("AEGISEDGE_SECRET must be at least 32 bytes; generate one with `openssl rand -hex 32`")
+		}
+		secretKey = []byte(s)
+	})
+	return secretKey
 }
 
 func generateSignature(val, ip string) string {
-	h := hmac.New(sha256.New, secretKey)
-	// Bind to both the value and the client IP for enterprise-grade security
+	h := hmac.New(sha256.New, getSecretKey())
 	h.Write([]byte(val + ":" + ip))
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -48,7 +60,6 @@ func ProgressiveChallenge(next http.Handler, rep *filter.ReputationManager) http
 
 		if token := r.URL.Query().Get("ae_token"); token != "" {
 			if verifyCookie(token, host) {
-				// Reward the IP for solving the challenge
 				if rep != nil {
 					rep.Reward(host)
 				}
@@ -59,9 +70,8 @@ func ProgressiveChallenge(next http.Handler, rep *filter.ReputationManager) http
 					MaxAge:   CookieExpiry,
 					SameSite: http.SameSiteStrictMode,
 					HttpOnly: true,
-					Secure:   true, // Must not be sent over plain HTTP
+					Secure:   r.TLS != nil,
 				})
-				// Strip the token from the URL and redirect to the clean path
 				target := r.URL.Path
 				if r.URL.RawQuery != "" {
 					q := r.URL.Query()
@@ -75,35 +85,35 @@ func ProgressiveChallenge(next http.Handler, rep *filter.ReputationManager) http
 			}
 		}
 
-		// 3. All other requests get the JS challenge page.
 		logger.Info("Serving JS challenge (no valid clearance)", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
 		serveChallenge(w, r, host)
 	})
 }
 
 func serveChallenge(w http.ResponseWriter, r *http.Request, ip string) {
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusServiceUnavailable)
 
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	sig := generateSignature(ts, ip)
-	token := fmt.Sprintf("%s.%s", ts, sig)
+	token := ts + "." + sig
 
-	// The JS sets the token as a query param and reloads so the server can
-	// set it as an HttpOnly cookie (JS can't set HttpOnly cookies itself).
-	redirectURL := r.URL.Path + "?ae_token=" + token
-	if r.URL.RawQuery != "" {
-		q := r.URL.Query()
-		q.Del("ae_token")
-		if encoded := q.Encode(); encoded != "" {
-			redirectURL += "&" + encoded
-		}
+	// Hardened 2026-10-04: encode the redirect target as a Go-quoted
+	// string literal (safe in JS double-quoted context). html.EscapeString
+	// is the wrong context inside <script> (entities are not decoded
+	// there); strconv.Quote escapes quotes, backslashes and control
+	// characters so a crafted path cannot break out of the string.
+	redirectPath := r.URL.Path
+	if redirectPath == "" {
+		redirectPath = "/"
 	}
+	jsTarget := strconv.Quote(redirectPath + "?ae_token=" + token)
 
-	html := `<!DOCTYPE html>
+	htmlBody := `<!DOCTYPE html>
 <html>
   <head>
     <title>AegisEdge — Checking your browser</title>
+    <meta charset="utf-8">
     <style>
       body { font-family: sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; background:#0d1117; color:#cdd9e5; }
       .box { text-align:center; }
@@ -118,13 +128,13 @@ func serveChallenge(w http.ResponseWriter, r *http.Request, ip string) {
       <p>AegisEdge Security &mdash; one moment please.</p>
       <script>
         setTimeout(function() {
-          window.location.href = "` + redirectURL + `";
+          window.location.href = ` + jsTarget + `;
         }, 2000);
       </script>
     </div>
   </body>
 </html>`
-	fmt.Fprint(w, html)
+	fmt.Fprint(w, htmlBody)
 }
 
 func verifyCookie(val, ip string) bool {
@@ -135,18 +145,30 @@ func verifyCookie(val, ip string) bool {
 
 	tsStr, providedSig := parts[0], parts[1]
 
-	// Constant-time HMAC comparison
+	// Constant-time HMAC comparison.
 	expectedSig := generateSignature(tsStr, ip)
 	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
-		logger.Warn("Invalid challenge cookie signature or IP mismatch", "value", val, "client_ip", ip)
+		logger.Warn("Invalid challenge cookie signature or IP mismatch", "client_ip", ip)
 		return false
 	}
 
-	// Expiry check
-	var ts int64
-	fmt.Sscanf(tsStr, "%d", &ts)
-	if time.Now().Unix() > ts+CookieExpiry {
+	// Hardened 2026-09-25 per Finding 2.5: strict integer parsing.
+	// Previous code used fmt.Sscanf which silently accepted "abc",
+	// "+1234567890", "-9223372036854775808" and produced surprising
+	// values; now we reject anything that is not a base-10 integer in
+	// the int64 range.
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		logger.Warn("Invalid challenge timestamp", "timestamp", tsStr)
+		return false
+	}
+	now := time.Now().Unix()
+	if now > ts+CookieExpiry {
 		logger.Warn("Expired challenge cookie", "timestamp", ts)
+		return false
+	}
+	if ts > now+300 {
+		logger.Warn("Future challenge timestamp (clock-skew or forgery)", "timestamp", ts)
 		return false
 	}
 

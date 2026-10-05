@@ -15,7 +15,8 @@ func TestL4Filter(t *testing.T) {
 	addr := "1.1.1.1:1234"
 	ip := "1.1.1.1"
 
-	if !f.AllowConnection(addr) {
+	allowed, release1 := f.AllowConnection(addr)
+	if !allowed {
 		t.Error("Initial connection should be allowed")
 	}
 
@@ -27,34 +28,33 @@ func TestL4Filter(t *testing.T) {
 		t.Errorf("Expected 1 connection in store for %s, got %d", ip, count)
 	}
 
-	if !f.AllowConnection(addr) {
+	allowed, release2 := f.AllowConnection(addr)
+	if !allowed {
 		t.Error("Second connection should be allowed")
 	}
 
 	// Third connection should be blocked (limit is 2)
-	if f.AllowConnection(addr) {
+	if allowed3, _ := f.AllowConnection(addr); allowed3 {
 		t.Error("Third connection should be blocked (limit is 2)")
 	}
 
 	// Whitelist bypass
-	if !f.AllowConnection("127.0.0.1:9999") {
+	if allowedWL, _ := f.AllowConnection("127.0.0.1:9999"); !allowedWL {
 		t.Error("Whitelisted IP should always be allowed")
 	}
 
-	f.ReleaseConnection(addr)
+	release1()
 	count, err = s.GetCounter("l4:conn:" + ip)
 	if err != nil {
 		t.Fatalf("GetCounter failed: %v", err)
 	}
 	// After releasing one of two held connections, count decrements to 1
-	// The limit is 2, so 2 connections held -> count is 2, releasing one -> count=1
-	// After releasing both, count=0
 	if count != 1 {
 		t.Errorf("Expected 1 connection after one release, got %d", count)
 	}
 
 	// Release again
-	f.ReleaseConnection(addr)
+	release2()
 	count, err = s.GetCounter("l4:conn:" + ip)
 	if err != nil {
 		t.Fatalf("GetCounter failed: %v", err)
@@ -65,7 +65,7 @@ func TestL4Filter(t *testing.T) {
 
 	// Zero limit = bypass
 	f2 := NewL4Filter(0, 1*time.Minute, s, nil)
-	if !f2.AllowConnection("10.0.0.1:1234") {
+	if allowedZ, _ := f2.AllowConnection("10.0.0.1:1234"); !allowedZ {
 		t.Error("Zero limit should allow all connections")
 	}
 }

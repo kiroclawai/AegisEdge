@@ -1,1 +1,6 @@
 goshield.code-workspace
+.env
+aegisedge
+stress_tool
+*.test
+*.out

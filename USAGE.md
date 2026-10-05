@@ -84,6 +84,11 @@ Hardcoded defaults  →  config.json  →  Environment variables
 | `AEGISEDGE_REDIS_ADDR` | Redis for cluster mode: `127.0.0.1:6379` |
 | `AEGISEDGE_REDIS_PASSWORD` | Redis password |
 | `AEGISEDGE_SECRET` | HMAC key for challenge cookies |
+| `AEGISEDGE_WAF_BODY_MAX_BYTES` | WAF inspect cap in bytes (1024–4194304, default 65536) |
+| `AEGISEDGE_DISABLE_MGMT` | `1` to not listen on the management API at all |
+| `AEGISEDGE_MGMT_BIND` | Management API bind (default `127.0.0.1:9091`) |
+| `AEGISEDGE_METRICS_BIND` | Prometheus bind (default `127.0.0.1:9090`) |
+| `AEGISEDGE_PPROF_BIND` | pprof bind (default `127.0.0.1:6060`) — never expose |
 | `AEGISEDGE_TRUSTED_PROXY` | Manual trusted proxy IPs/CIDRs (merged with auto-discovery) |
 | `AEGISEDGE_WEBHOOK_URL` | Webhook URL for attack alerts (Slack, Discord, PagerDuty) |
 

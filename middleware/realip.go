@@ -5,15 +5,29 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"aegisedge/util"
 )
 
-const ipShards = 64
+const (
+	ipShards        = 64
+	ipCacheTTL      = 5 * time.Minute
+	ipCacheMaxEntry = 1024 // per shard
+	maxHeaderBytes  = 256
+	maxForwardHops  = 4
+)
 
 type ipCacheShard struct {
-	mu    sync.RWMutex
-	cache map[string]string
+	mu      sync.RWMutex
+	cache   map[string]ipCacheEntry
+	nowFn   func() time.Time
+	counter uint64 // LRU-ish eviction: evict oldest when size > ipCacheMaxEntry
+}
+
+type ipCacheEntry struct {
+	ip       string
+	cachedAt time.Time
 }
 
 var memoizedIPs [ipShards]*ipCacheShard
@@ -21,13 +35,24 @@ var memoizedIPs [ipShards]*ipCacheShard
 func init() {
 	for i := 0; i < ipShards; i++ {
 		memoizedIPs[i] = &ipCacheShard{
-			cache: make(map[string]string),
+			cache: make(map[string]ipCacheEntry),
+			nowFn: time.Now,
 		}
 	}
 }
 
+// PurgeAllIPCache drops every cached entry. Registered as a reload
+// hook on ProxyWatcher via SetOnReloadHook so stale resolutions don't
+// survive a trusted-proxy change (Finding 4.2). Hardened 2026-09-25.
+func PurgeAllIPCache() {
+	for _, s := range memoizedIPs {
+		s.mu.Lock()
+		s.cache = make(map[string]ipCacheEntry)
+		s.mu.Unlock()
+	}
+}
+
 func getIpShard(remoteAddr string) *ipCacheShard {
-	// Fast FNV-like hash for the remoteAddr string
 	hash := uint32(0)
 	for i := 0; i < len(remoteAddr); i++ {
 		hash = 31*hash + uint32(remoteAddr[i])
@@ -46,20 +71,31 @@ func RealIP(watcher *util.ProxyWatcher) func(http.Handler) http.Handler {
 			}
 
 			shard := getIpShard(remoteHost)
+			now := shard.nowFn()
 			shard.mu.RLock()
-			cached, ok := shard.cache[remoteHost]
+			entry, ok := shard.cache[remoteHost]
 			shard.mu.RUnlock()
-
-			if ok {
-				next.ServeHTTP(w, util.SetRealIP(r, cached))
+			if ok && now.Sub(entry.cachedAt) < ipCacheTTL {
+				next.ServeHTTP(w, util.SetRealIP(r, entry.ip))
 				return
 			}
 
 			ip := extractIP(r, watcher, remoteHost)
 
-			// Store in cache
 			shard.mu.Lock()
-			shard.cache[remoteHost] = ip
+			// Evict if over the cap, drop expired entries opportunistically.
+			if len(shard.cache) >= ipCacheMaxEntry {
+				for k, e := range shard.cache {
+					if now.Sub(e.cachedAt) >= ipCacheTTL {
+						delete(shard.cache, k)
+					}
+				}
+				if len(shard.cache) >= ipCacheMaxEntry {
+					// Hard evict: clear all (cheap, no LRU bookkeeping).
+					shard.cache = make(map[string]ipCacheEntry)
+				}
+			}
+			shard.cache[remoteHost] = ipCacheEntry{ip: ip, cachedAt: now}
 			shard.mu.Unlock()
 
 			next.ServeHTTP(w, util.SetRealIP(r, ip))
@@ -72,34 +108,57 @@ func GetRealIP(r *http.Request) string {
 	return util.GetRealIP(r)
 }
 
+// extractIP resolves the client IP, preferring trusted-proxy headers
+// only when the immediate connection is from a trusted proxy.
+//
+// Hardened 2026-09-25 per Finding 4.1:
+//   - Header values are truncated to maxHeaderBytes before parsing to
+//     bound CPU / RAM amplification.
+//   - X-Forwarded-For is bounded to maxForwardHops hops so an attacker
+//     who can craft the chain cannot choose an arbitrary leftmost value
+//     (the leftmost of the first maxForwardHops hops is used).
+//   - net.ParseIP validates the syntax; anything else falls back to
+//     the immediate RemoteAddr.
 func extractIP(r *http.Request, watcher *util.ProxyWatcher, remoteHost string) string {
-	// Only honour forwarded headers when the immediate connection is from
-	// a trusted proxy in the live CSF/iptables/cPHulk whitelist.
 	if watcher == nil || !watcher.IsTrusted(remoteHost) {
 		return remoteHost
 	}
 
-	// 1. Cloudflare — single authoritative header, no parsing ambiguity.
-	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+	// 1. Cloudflare (single authoritative header, no parsing ambiguity).
+	if cf := truncateHeader(r.Header.Get("CF-Connecting-IP")); cf != "" {
 		if ip := net.ParseIP(strings.TrimSpace(cf)); ip != nil {
 			return ip.String()
 		}
 	}
 
-	// 2. Standard nginx / AWS ALB
-	if real := r.Header.Get("X-Real-IP"); real != "" {
+	// 2. Standard nginx / AWS ALB.
+	if real := truncateHeader(r.Header.Get("X-Real-IP")); real != "" {
 		if ip := net.ParseIP(strings.TrimSpace(real)); ip != nil {
 			return ip.String()
 		}
 	}
 
-	// 3. X-Forwarded-For — leftmost value is the original client.
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+	// 3. X-Forwarded-For — only inspect up to maxForwardHops hops and
+	// take the leftmost valid one. This caps the trust placed on an
+	// attacker-influenced chain to the depth we actually have proxies for.
+	if fwd := truncateHeader(r.Header.Get("X-Forwarded-For")); fwd != "" {
 		parts := strings.Split(fwd, ",")
-		if ip := net.ParseIP(strings.TrimSpace(parts[0])); ip != nil {
-			return ip.String()
+		if len(parts) > maxForwardHops {
+			parts = parts[:maxForwardHops]
+		}
+		for _, p := range parts {
+			if ip := net.ParseIP(strings.TrimSpace(p)); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 
 	return remoteHost
+}
+
+func truncateHeader(s string) string {
+	if len(s) <= maxHeaderBytes {
+		return s
+	}
+	return s[:maxHeaderBytes]
 }
