@@ -7,7 +7,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o aegisedge .
+ARG AEGISEDGE_VERSION=v1.0.0-beta.1
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=$AEGISEDGE_VERSION" -o aegisedge .
 
 # ---
 FROM alpine:3.19

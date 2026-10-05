@@ -85,6 +85,10 @@ type ManagementAPI struct {
 	ProxyWatcher *utilpkg.ProxyWatcher
 	RequestCount atomic.Uint64
 	StartTime    time.Time
+	// Version is the release version stamped by main (main.Version).
+	// Empty when constructed directly (e.g. in tests) — omitted from
+	// /api/status in that case.
+	Version string
 }
 
 type BlockRequest struct {
@@ -190,7 +194,7 @@ func (api *ManagementAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 	uptimeSeconds := time.Since(api.StartTime).Seconds()
 	avgRps := float64(totalReqs) / uptimeSeconds
 
-	json.NewEncoder(w).Encode(map[string]any{
+	status := map[string]any{
 		"status":           "active",
 		"uptime_seconds":   int(uptimeSeconds),
 		"total_requests":   totalReqs,
@@ -199,7 +203,11 @@ func (api *ManagementAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"fast_path_blocks": filter.GetSoftBlocks(),
 		"toggles":          api.Toggles.Snapshot(),
 		"timestamp":        time.Now(),
-	})
+	}
+	if api.Version != "" {
+		status["version"] = api.Version
+	}
+	json.NewEncoder(w).Encode(status)
 }
 
 func (api *ManagementAPI) handleBlock(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,7 @@ import (
 	"aegisedge/logger"
 	"aegisedge/manager"
 	"aegisedge/middleware"
+	"aegisedge/notifier"
 	"aegisedge/proxy"
 	"aegisedge/store"
 	"aegisedge/util"
@@ -51,7 +52,7 @@ func main() {
 		logger.SetLevel(cfg.LogLevel)
 	}
 
-	logger.Info("Starting AegisEdge", "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
+	logger.Info("Starting AegisEdge", "version", Version, "listen_ports", cfg.ListenPorts, "upstream", cfg.UpstreamAddr)
 
 	// Initialize Storage (Local with Redis upgrade)
 	var activeStore store.Storer = store.NewLocalStore()
@@ -159,6 +160,8 @@ func main() {
 
 	// Management API Instance
 	mgmt := manager.NewManagementAPI(activeStore, toggles, proxyWatcher)
+	mgmt.Version = Version
+	notifier.SetUserAgent("AegisEdge/" + Version)
 
 	// finalHandler: L3/L4 gate + Prometheus metrics + upstream proxy
 	finalHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -186,14 +189,14 @@ func main() {
 				return
 			}
 
-		// Layer 4 (uses the resolved client IP, not the TCP peer).
-		// Hardened 2026-10-05: previously r.RemoteAddr (the load
-		// balancer / CDN edge when behind a trusted proxy), which
-		// lumped every client into one shared connection bucket —
-		// a single abusive client tripped the cap for everyone and
-		// per-attacker limiting did not exist. L3 above already
-		// uses `host`; L4 must match.
-		allowed, release := l4.AllowConnection(host)
+			// Layer 4 (uses the resolved client IP, not the TCP peer).
+			// Hardened 2026-10-05: previously r.RemoteAddr (the load
+			// balancer / CDN edge when behind a trusted proxy), which
+			// lumped every client into one shared connection bucket —
+			// a single abusive client tripped the cap for everyone and
+			// per-attacker limiting did not exist. L3 above already
+			// uses `host`; L4 must match.
+			allowed, release := l4.AllowConnection(host)
 			if !allowed {
 				if toggles.IsEnabled("stats") {
 					filter.BlockedRequests.WithLabelValues("L4", "conn_limit").Inc()

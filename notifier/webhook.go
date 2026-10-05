@@ -21,6 +21,17 @@ import (
 	"aegisedge/logger"
 )
 
+// UserAgent is sent on every webhook delivery. Overridden by main at
+// startup so receivers see the running release (SetUserAgent).
+var UserAgent = "AegisEdge/1.0"
+
+// SetUserAgent overrides the default User-Agent header value.
+func SetUserAgent(ua string) {
+	if ua != "" {
+		UserAgent = ua
+	}
+}
+
 // WebhookMessage is the JSON body sent to all configured receivers.
 type WebhookMessage struct {
 	Text      string    `json:"text"`
@@ -223,7 +234,7 @@ func (s *Sender) deliver(origBody []byte, kind string) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "AegisEdge/1.0")
+		req.Header.Set("User-Agent", UserAgent)
 		req.Header.Set("X-Aegis-Timestamp", ts)
 		req.Header.Set("X-Aegis-Signature", sig)
 
